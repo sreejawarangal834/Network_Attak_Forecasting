@@ -315,19 +315,123 @@ D:\Network_Attak_Forecasting
 ├── src/
 │   ├── model.py                      ← shared architecture + loader
 │   ├── mitre_mapping.py              ← ATT&CK stage mapping
+│   ├── alert_manager.py              ← email alert / risk escalation
+│   ├── main.py                       ← FastAPI REST API
 │   ├── simulate_temporal_traffic.py
 │   ├── build_fused_states.py
 │   ├── build_fused_sequences.py
 │   ├── split_fused_sequences.py
+│   ├── train_world_model.py
 │   ├── train_logistic_baseline.py
 │   ├── world_model_rollout.py
 │   ├── evaluate_rollout.py
 │   ├── predict.py
 │   └── explain_prediction.py
 │
+├── .env.example                      ← credential template (safe to commit)
 ├── README.md
 └── requirements.txt
 ```
+
+---
+
+## REST API
+
+The trained World Model is exposed as a FastAPI REST API so the frontend team
+can query predictions over HTTP/JSON without any ML dependencies.
+
+### Run API
+
+From project root:
+```bash
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8000
+```
+Development (auto-reload on file save):
+```bash
+uvicorn src.main:app --reload
+```
+
+- Swagger UI : http://127.0.0.1:8000/docs
+- ReDoc      : http://127.0.0.1:8000/redoc
+
+**Key properties of the API**
+- CPU-only — no GPU required.
+- `models/world_model.pt` is loaded once at startup, read-only.
+- No retraining occurs at any point.
+- `/forecast/{id}` is fully autoregressive — the model's own predicted state
+  is fed back at each step; ground-truth future states are never used.
+- MITRE ATT&CK mapping is a **prototype stage-to-technique mapping** only.
+- CORS is open (`*`) for local development; restrict `allow_origins` in production.
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Liveness check |
+| GET | `/model/info` | Architecture metadata |
+| GET | `/samples` | Dataset summary |
+| GET | `/predict/{sample_id}` | Single-step prediction |
+| GET | `/forecast/{sample_id}` | 5-step autoregressive forecast |
+| GET | `/forecast/{sample_id}/states` | Predicted feature vectors (inverse-scaled) |
+| GET | `/explain/{sample_id}` | Feature ablation sensitivity (top 10) |
+| GET | `/model/comparison` | LR vs Transformer comparison table |
+
+#### Example requests & responses
+
+```bash
+# Health
+curl http://127.0.0.1:8000/health
+# {"status":"healthy","model":"Temporal Transformer World Model","device":"cpu","input_shape":[5,44]}
+
+# Single prediction
+curl http://127.0.0.1:8000/predict/100
+# {"sample_id":100,"current_true_stage":"Reconnaissance","attack_probability":0.9822,
+#  "attack_detected":true,"predicted_stage":"Reconnaissance","stage_confidence":0.8992,
+#  "mitre_attack_id":"T1595","mitre_attack_name":"Active Scanning"}
+
+# 5-step forecast
+curl http://127.0.0.1:8000/forecast/100
+# {"sample_id":100,"horizon":5,"ground_truth_used":false,
+#  "forecast":[{"step":1,"stage":"Reconnaissance","attack_probability":0.9822,...}, ...]}
+
+# Predicted state vectors (44 features, inverse-transformed)
+curl http://127.0.0.1:8000/forecast/100/states
+
+# Feature sensitivity explainability
+curl http://127.0.0.1:8000/explain/100
+# {"sample_id":100,"method":"feature_ablation_sensitivity",
+#  "warning":"Sensitivity indicates prediction influence and does not establish causation.",
+#  "features":[{"rank":1,"feature":"ack_to_packet_ratio","sensitivity":0.025616}, ...]}
+
+# Error handling
+curl http://127.0.0.1:8000/predict/999999
+# HTTP 404: {"detail":"Sample index out of range. Valid range: 0-653."}
+```
+
+### Frontend Integration Notes
+
+During local development the frontend can call:
+
+```
+http://127.0.0.1:8000
+```
+
+Example (JavaScript fetch):
+```js
+const res  = await fetch("http://127.0.0.1:8000/forecast/100");
+const data = await res.json();
+// data.forecast[0].stage            → "Reconnaissance"
+// data.forecast[0].attack_probability → 0.9822
+// data.forecast[0].mitre_attack_id  → "T1595"
+```
+
+The frontend can visualise:
+- Attack probability per step (bar/line chart)
+- Predicted stage per step (timeline / stage indicator)
+- Stage confidence (confidence band)
+- MITRE ATT&CK technique (badge / tooltip)
+- 5-step trajectory (animated sequence)
+- Top prediction-sensitive features (`/explain/{id}`)
 
 ---
 
@@ -341,3 +445,272 @@ For CPU-only PyTorch:
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
+
+---
+
+## Email Alert System
+
+The API includes a risk escalation and email notification system. When the
+World Model forecasts elevated or critical risk, a defender can be notified
+via email with a structured cybersecurity alert.
+
+### How risk levels are calculated
+
+Risk is derived from the model's attack probability and predicted stage:
+
+| Predicted Stage | Attack Probability | Risk Level |
+|-----------------|--------------------|------------|
+| Benign          | any                | NONE       |
+| Non-Benign      | < 0.50             | LOW        |
+| Non-Benign      | 0.50 – 0.74        | MEDIUM     |
+| Non-Benign      | 0.75 – 0.89        | HIGH       |
+| Non-Benign      | ≥ 0.90             | CRITICAL   |
+
+Benign predictions never trigger an alert regardless of the numerical
+probability, to avoid false alarms from model artefacts.
+
+### What constitutes escalation
+
+An alert email is sent only on **meaningful escalation**:
+
+- Risk level increases (e.g. MEDIUM → HIGH)
+- Attack stage advances along the kill-chain (e.g. Recon → BruteForce)
+- First evaluation of a sample (no previous state)
+
+Repeated evaluation at the same risk level and stage does **not** send
+duplicate emails.
+
+### Duplicate alert prevention & cooldown
+
+Each sample has an in-memory state tracking the last alert sent.
+A configurable cooldown period (default 300 s) suppresses repeat emails
+even if escalation is detected, preventing accidental flooding.
+
+Set `ALERT_COOLDOWN_SECONDS` in `.env` to adjust.
+
+> **Production note:** The in-memory state is reset on API restart.
+> For multi-instance deployments, use a shared Redis or database backend.
+
+### Configure Gmail SMTP
+
+1. Copy the template:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` with your credentials:
+   ```env
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USERNAME=your_email@gmail.com
+   SMTP_PASSWORD=your_gmail_app_password
+   ALERT_RECIPIENT=defender@example.com
+   ALERTS_ENABLED=true
+   ALERT_COOLDOWN_SECONDS=300
+   ```
+
+3. **NEVER commit `.env` to Git.** It is already in `.gitignore`.
+
+### Gmail App Password
+
+Gmail requires an **App Password** (not your normal login password) when
+using SMTP with 2-Step Verification enabled.
+
+Generate one at: https://myaccount.google.com/apppasswords
+
+- Requires 2-Step Verification on your Google account.
+- Generate a new App Password for "Mail" / "Windows Computer".
+- Place the 16-character password in `SMTP_PASSWORD` inside your local `.env`.
+- Never share or commit this value.
+
+### .env template
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your_email@gmail.com
+SMTP_PASSWORD=your_gmail_app_password
+ALERT_RECIPIENT=defender@example.com
+ALERTS_ENABLED=true
+ALERT_COOLDOWN_SECONDS=300
+```
+
+### Alert API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/alerts/status`              | Email configuration status (no credentials returned) |
+| POST | `/alerts/test`                | Send a test email to verify SMTP config |
+| POST | `/alerts/evaluate/{sample_id}`| Evaluate risk and send alert if escalation detected |
+
+```bash
+# Check configuration status
+curl http://127.0.0.1:8000/alerts/status
+
+# Send a test email
+curl -X POST http://127.0.0.1:8000/alerts/test
+
+# Evaluate sample 100 and send alert if escalation detected
+curl -X POST http://127.0.0.1:8000/alerts/evaluate/100
+```
+
+Example evaluate response:
+```json
+{
+  "sample_id": 100,
+  "risk_level": "CRITICAL",
+  "attack_probability": 0.9822,
+  "predicted_stage": "Reconnaissance",
+  "mitre_attack_id": "T1595",
+  "mitre_attack_name": "Active Scanning",
+  "escalation_detected": true,
+  "email_sent": true,
+  "reason": "Alert email sent to defender@example.com."
+}
+```
+
+When alerts are disabled:
+```json
+{
+  "email_sent": false,
+  "reason": "Alerts are disabled."
+}
+```
+
+When cooldown suppresses a repeat:
+```json
+{
+  "escalation_detected": true,
+  "email_sent": false,
+  "reason": "Alert suppressed by cooldown (287s remaining)."
+}
+```
+
+### Frontend integration for alerts
+
+The frontend should call `POST /alerts/evaluate/{sample_id}` explicitly
+when the operator requests an alert check — **not** on every page refresh.
+This avoids accidental email flooding.
+
+Display the result to the operator:
+
+```js
+// Evaluate and potentially send alert
+const res  = await fetch(`http://127.0.0.1:8000/alerts/evaluate/${sampleId}`,
+                         { method: 'POST' });
+const data = await res.json();
+// data.risk_level         → "CRITICAL"
+// data.email_sent         → true / false
+// data.escalation_detected→ true / false
+// data.reason             → human-readable status
+```
+
+The frontend should display:
+- 🔴 CRITICAL / 🟠 HIGH / 🟡 MEDIUM / 🟢 LOW / ⚪ NONE
+- `email_sent: true` → "✓ Defender notified"
+- `email_sent: false` → reason string (disabled / cooldown / no escalation)
+
+SMTP credentials must never appear in the frontend — only the FastAPI backend
+handles email sending.
+
+### Security considerations
+
+- `.env` is git-ignored; never commit it.
+- `SMTP_PASSWORD` is never logged or returned in any API response.
+- `/alerts/status` only returns boolean flags, never credential values.
+- Restrict `allow_origins` in CORS middleware before production deployment.
+- Use environment variables or a secrets manager (not hardcoded values) in all
+  deployment environments.
+
+---
+
+---
+
+## Upload & Analysis Pipeline
+
+### Workflow
+
+```
+CSV file upload
+  → Extension check (.csv only — PCAP not supported)
+  → File size check (max 50 MB)
+  → Schema detection (packet or flow telemetry)
+  → Required column validation
+  → Timestamp validation
+  → 10-second network-state windows
+  → 44-feature aggregation (same order as training)
+  → Standardise with training-set scaler (never refit)
+  → Build 5-window sequences
+  → Temporal Transformer inference (latest sequence)
+  → 5-step autoregressive forecast
+  → Feature ablation sensitivity (explainability)
+  → Evaluation metrics (if ground-truth labels present)
+  → JSON response
+```
+
+### Supported file formats
+
+| Type | Required columns (key subset) |
+|---|---|
+| Packet CSV | `timestamp, src_ip, dst_ip, src_port, dst_port, protocol, packet_size, ttl, tcp_window, syn, ack, rst, fin` |
+| Flow CSV | `timestamp, src_ip, dst_ip, flow_duration, total_bytes, flow_iat_mean, syn_flag_count, …` |
+
+Compatible with `simulated_packets.csv` and `simulated_flow.csv` from the simulation pipeline.
+
+**PCAP upload is not supported.** Upload a CSV telemetry file.
+
+### Minimum requirements
+
+- At least **50 records** (to form enough windows)
+- At least **5 temporal windows** of 10 seconds each (so 50+ seconds of traffic)
+- A parseable `timestamp` column
+
+### Upload API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/upload` | Upload CSV, get `upload_id` |
+| `POST` | `/analyze/{upload_id}` | Run full analysis pipeline |
+| `GET`  | `/analysis/{analysis_id}` | Retrieve completed analysis |
+| `GET`  | `/analysis/{analysis_id}/forecast` | 5-step forecast only |
+| `GET`  | `/analysis/{analysis_id}/states` | 10-second state windows |
+| `GET`  | `/analysis/{analysis_id}/explain` | Feature sensitivity |
+| `GET`  | `/analysis/{analysis_id}/metrics` | Evaluation metrics (if labels present) |
+
+### Example workflow
+
+```bash
+# 1. Upload
+curl -F "file=@simulated_packets.csv" http://127.0.0.1:8000/upload
+# → {"upload_id": "abc123", "file_type": "packet", "rows": 50000, ...}
+
+# 2. Analyse
+curl -X POST http://127.0.0.1:8000/analyze/abc123
+# → {"analysis_id": "abc123", "current_state": {...}, "forecast": [...], ...}
+
+# 3. Get forecast
+curl http://127.0.0.1:8000/analysis/abc123/forecast
+
+# 4. Get explainability
+curl http://127.0.0.1:8000/analysis/abc123/explain
+
+# 5. Get metrics (only populated if CSV had label/attack_type column)
+curl http://127.0.0.1:8000/analysis/abc123/metrics
+```
+
+### Error codes
+
+| Code | Meaning |
+|---|---|
+| 400 | Bad request (empty file, wrong extension) |
+| 413 | File too large (>50 MB) |
+| 422 | Schema/validation error (wrong columns, bad timestamps) |
+| 404 | Upload ID or analysis ID not found |
+| 500 | Internal pipeline error |
+
+### Evaluation mode vs forecast-only mode
+
+- **Forecast mode** (default): no labels needed — returns attack probability, stage, trajectory, MITRE, explainability.
+- **Evaluation mode**: if the CSV contains a `label`, `attack_type`, or `attack_stage` column, the API also computes attack accuracy, precision, recall, and F1 against those ground-truth labels.
+
+---
