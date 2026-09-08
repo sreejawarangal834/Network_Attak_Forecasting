@@ -1,0 +1,11 @@
+# Predictive Cyber Defence — World Model
+# Frontend dependencies
+# Install: pip install -r requirements.txt
+# Run:     streamlit run frontend/app.py
+
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+
+# Verified against: streamlit 1.63.0, pandas 2.3.3, numpy 2.3.4, plotly 6.3.1

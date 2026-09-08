@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+/* ── Custom CSS variables for the SOC dark theme ── */
+:root {
+  --bg-base:       #070d1a;
+  --bg-surface:    #0d1526;
+  --bg-elevated:   #111e35;
+  --bg-border:     #1a2c4a;
+  --text-primary:  #e2e8f0;
+  --text-secondary:#7d95b5;
+  --text-muted:    #3d5275;
+  --accent-blue:   #3b82f6;
+  --accent-cyan:   #06b6d4;
+  --risk-low:      #22c55e;
+  --risk-medium:   #f59e0b;
+  --risk-high:     #ef4444;
+  --risk-critical: #7c3aed;
+}
+
+/* ── Base resets ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--bg-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2a4060; }
+
+/* ── Recharts tooltip ── */
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--bg-border) !important;
+  border-radius: 6px !important;
+  color: var(--text-primary) !important;
+  font-size: 0.8rem;
+}
+.recharts-cartesian-grid line { stroke: var(--bg-border) !important; }
+.recharts-cartesian-axis-tick text { fill: var(--text-muted) !important; }
+
+/* ── Page fade-in animation ── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.page-enter { animation: fadeIn 0.2s ease-out both; }
+
+/* ── Pulse dot for live indicator ── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
