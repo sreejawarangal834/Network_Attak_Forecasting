@@ -1,0 +1,20 @@
+# ============================================================
+# requirements.txt
+# SIH "AI World Models for Predictive Cyber Defence"
+# CPU-only backend dependencies
+# ============================================================
+
+# Core numerical / data
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# Deep learning — CPU build
+# Install CPU-only PyTorch with:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
+
+# Progress / utility (optional but used by some training scripts)
+tqdm>=4.65.0

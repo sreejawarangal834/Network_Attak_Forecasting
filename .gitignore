@@ -1,0 +1,47 @@
+﻿ @"
+# Raw datasets
+datasets/
+
+# Generated / processed data
+data/
+*.csv
+*.parquet
+*.npz
+*.binetflow
+
+# Trained models / checkpoints
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Generated results
+results/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Archives
+*.zip
+*.tar
+*.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
