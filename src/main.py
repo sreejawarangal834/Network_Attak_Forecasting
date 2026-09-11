@@ -74,6 +74,7 @@ from telemetry_pipeline import (
     process_uploaded_csv, FEATURE_COLUMNS as PIPELINE_FEATURE_COLUMNS,
     SEQUENCE_LENGTH as PIPELINE_SEQ_LEN,
 )
+from db import init_db, persist_run, list_runs, get_run, get_run_forecast, restore_all_runs
 
 # ============================================================
 # Paths
@@ -151,9 +152,15 @@ async def lifespan(app: FastAPI):
     cooldown = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "300"))
     state.alert_mgr = AlertStateManager(cooldown_seconds=cooldown)
 
+    # ── Initialise SQLite database ─────────────────────────────
+    init_db()
+    restored = restore_all_runs(_analysis_store)
+
     print(f"[startup] model loaded  : {MODEL_FILE.name}  ({state.n_params:,} params)")
     print(f"[startup] dataset loaded: {DATA_FILE.name}  ({len(state.X_test)} test samples)")
     print(f"[startup] device        : {DEVICE}")
+    if restored:
+        print(f"[startup] restored {restored} run(s) from SQLite into memory store")
 
     yield   # application runs here
 
@@ -766,6 +773,134 @@ class StatesResponse(BaseModel):
 
 
 # ============================================================
+# Helper: build entity summary from pipeline entities
+# ============================================================
+
+def _build_entity_summary(
+    pipe,
+    network_risk:  str,
+    attack_prob:   float,
+    pred_stage:    str,
+    stage_conf:    float,
+    mitre:         dict,
+    forecast:      list,
+) -> Optional[dict]:
+    """
+    Build the entity summary dict for storage in _analysis_store.
+
+    Since the model is network-level only, every entity receives the same
+    network-level risk/stage values.  The summary clearly labels this as
+    NETWORK-LEVEL PREDICTION when no entity IDs are present, or provides
+    individual device rows when src_ip/dst_ip columns were found.
+
+    Returns None only when there is truly no entity data and not even a
+    network-level summary to show (should never happen).
+    """
+    # Build the forecast trajectory list (for frontend display)
+    trajectory = [
+        {
+            "step":               f["step"],
+            "stage":              f["stage"],
+            "attack_probability": f["attack_probability"],
+            "stage_confidence":   f["stage_confidence"],
+            "risk":               f["risk"],
+            "mitre_attack_id":    f["mitre_attack_id"],
+            "mitre_attack_name":  f["mitre_attack_name"],
+        }
+        for f in forecast
+    ]
+
+    # Highest predicted risk across the forecast
+    risk_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    highest_risk = max(
+        [f["risk"] for f in forecast] + [network_risk],
+        key=lambda r: risk_order.get(r, -1),
+    )
+
+    if not pipe.has_entity_ids or not pipe.entities:
+        # No valid IP columns → network-level prediction only
+        return {
+            "has_entity_ids":   False,
+            "prediction_scope": "network-level",
+            "total_entities":   0,
+            "entities":         [],
+            "network_prediction": {
+                "attack_probability": attack_prob,
+                "risk":               network_risk,
+                "highest_risk":       highest_risk,
+                "predicted_stage":    pred_stage,
+                "stage_confidence":   stage_conf,
+                "mitre_attack_id":    mitre["mitre_attack_id"],
+                "mitre_attack_name":  mitre["mitre_attack_name"],
+                "trajectory":         trajectory,
+            },
+        }
+
+    # We have entity IDs — build per-entity rows.
+    # The risk/stage/probability values are the network-level model outputs
+    # applied uniformly; we do NOT manufacture per-entity model predictions.
+    normal_threshold   = 0.30
+    suspicious_threshold = 0.50
+
+    entities_out = []
+    for ent in pipe.entities:
+        entities_out.append({
+            "entity_id":          ent.entity_id,
+            "record_count":       ent.record_count,
+            "first_seen":         ent.first_seen,
+            "last_seen":          ent.last_seen,
+            "unique_dst_ips":     ent.unique_dst_ips,
+            "unique_dst_ports":   ent.unique_dst_ports,
+            "protocols":          ent.protocols,
+            # Network-level inference values (same for all entities from
+            # this upload — clearly labelled as network-scope).
+            "attack_probability": attack_prob,
+            "risk":               network_risk,
+            "highest_risk":       highest_risk,
+            "predicted_stage":    pred_stage,
+            "stage_confidence":   stage_conf,
+            "mitre_attack_id":    mitre["mitre_attack_id"],
+            "mitre_attack_name":  mitre["mitre_attack_name"],
+            "trajectory":         trajectory,
+            "prediction_scope":   "network-level",
+        })
+
+    # Aggregate device counts using the network-level thresholds
+    if attack_prob < normal_threshold:
+        normal_count     = len(entities_out)
+        suspicious_count = 0
+        high_risk_count  = 0
+    elif attack_prob < suspicious_threshold:
+        normal_count     = 0
+        suspicious_count = len(entities_out)
+        high_risk_count  = 0
+    else:
+        normal_count     = 0
+        suspicious_count = 0
+        high_risk_count  = len(entities_out)
+
+    return {
+        "has_entity_ids":   True,
+        "prediction_scope": "network-level",
+        "total_entities":   len(entities_out),
+        "normal_count":     normal_count,
+        "suspicious_count": suspicious_count,
+        "high_risk_count":  high_risk_count,
+        "entities":         entities_out,
+        "network_prediction": {
+            "attack_probability": attack_prob,
+            "risk":               network_risk,
+            "highest_risk":       highest_risk,
+            "predicted_stage":    pred_stage,
+            "stage_confidence":   stage_conf,
+            "mitre_attack_id":    mitre["mitre_attack_id"],
+            "mitre_attack_name":  mitre["mitre_attack_name"],
+            "trajectory":         trajectory,
+        },
+    }
+
+
+# ============================================================
 # Helper: run full analysis from a pipeline result
 # ============================================================
 
@@ -902,6 +1037,21 @@ def _run_analysis(
             },
         })
 
+    # ── Entity summary (from preserved IP identifiers) ─────────
+    # The current model is network-level only.  Entities are extracted
+    # from raw telemetry IP columns for user visibility; the risk/stage
+    # values are the network-level inference result applied to all entities
+    # — not per-entity model predictions.
+    entity_summary = _build_entity_summary(
+        pipe         = pipe,
+        network_risk = risk,
+        attack_prob  = attack_prob,
+        pred_stage   = pred_stage,
+        stage_conf   = stage_conf,
+        mitre        = mitre,
+        forecast     = forecast,
+    )
+
     result = {
         "analysis_id":  analysis_id,
         "status":       "completed",
@@ -914,11 +1064,12 @@ def _run_analysis(
             "ts_end":       pipe.ts_end,
             "file_type":    pipe.file_type,
         },
-        "current_state":  current_state,
-        "forecast":       forecast,
-        "explainability": explainability,
-        "metrics":        metrics,
-        "windows":        windows_out,
+        "current_state":   current_state,
+        "forecast":        forecast,
+        "explainability":  explainability,
+        "metrics":         metrics,
+        "windows":         windows_out,
+        "entity_summary":  entity_summary,   # new — may be None
     }
 
     return result
@@ -1050,6 +1201,17 @@ def analyze(upload_id: str) -> AnalysisResponse:
         )
 
     _analysis_store[upload_id] = stored
+
+    # ── Persist to SQLite ──────────────────────────────────────
+    try:
+        persist_run(stored, source_type="uploaded")
+    except Exception as db_exc:
+        # DB failure must not break the API response — log and continue
+        import logging
+        logging.getLogger("main").warning(
+            "[db] persist_run failed for %s: %s", upload_id, db_exc
+        )
+
     return AnalysisResponse(**_to_analysis_response(stored))
 
 
@@ -1118,6 +1280,105 @@ def get_analysis_explain(analysis_id: str) -> dict:
     }
 
 
+# ── GET /analysis/{analysis_id}/entities ─────────────────────────────────
+
+@app.get("/analysis/{analysis_id}/entities", tags=["Upload"])
+def get_analysis_entities(analysis_id: str) -> dict:
+    """
+    Return monitored entities and their current risk from a completed analysis.
+
+    Prediction scope is always "network-level" — the current model was trained
+    on network-aggregated states and does not produce per-entity predictions.
+    Risk/stage values are the network-level model output applied uniformly.
+
+    When the uploaded file contains src_ip/dst_ip columns, individual device
+    identifiers are returned.  When those columns are absent the response
+    carries prediction_scope="network-level" and an empty entities list,
+    with the aggregated network prediction in the network_prediction field.
+
+    Response shape
+    --------------
+    {
+      "analysis_id":      str,
+      "has_entity_ids":   bool,
+      "prediction_scope": "network-level",
+      "total_entities":   int,
+      "normal_count":     int,          # only present when has_entity_ids=True
+      "suspicious_count": int,
+      "high_risk_count":  int,
+      "entities": [
+        {
+          "entity_id":          str,
+          "record_count":       int,
+          "first_seen":         str,
+          "last_seen":          str,
+          "unique_dst_ips":     list[str],
+          "unique_dst_ports":   list[int],
+          "protocols":          list[str],
+          "attack_probability": float,
+          "risk":               str,
+          "highest_risk":       str,
+          "predicted_stage":    str,
+          "stage_confidence":   float,
+          "mitre_attack_id":    str | null,
+          "mitre_attack_name":  str | null,
+          "trajectory":         list[ForecastStep],
+          "prediction_scope":   "network-level"
+        }, ...
+      ],
+      "network_prediction": { attack_probability, risk, highest_risk,
+                              predicted_stage, stage_confidence,
+                              mitre_attack_id, mitre_attack_name,
+                              trajectory }
+    }
+    """
+    if analysis_id not in _analysis_store:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Analysis ID '{analysis_id}' not found.",
+        )
+    s = _analysis_store[analysis_id]
+    summary = s.get("entity_summary")
+    if summary is None:
+        # Fallback: build a minimal network-level response from stored current_state
+        cs = s["current_state"]
+        traj = [
+            {
+                "step":               f["step"],
+                "stage":              f["stage"],
+                "attack_probability": f["attack_probability"],
+                "stage_confidence":   f["stage_confidence"],
+                "risk":               f["risk"],
+                "mitre_attack_id":    f["mitre_attack_id"],
+                "mitre_attack_name":  f["mitre_attack_name"],
+            }
+            for f in s["forecast"]
+        ]
+        risk_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+        highest = max(
+            [f["risk"] for f in s["forecast"]] + [cs["risk"]],
+            key=lambda r: risk_order.get(r, -1),
+        )
+        summary = {
+            "has_entity_ids":   False,
+            "prediction_scope": "network-level",
+            "total_entities":   0,
+            "entities":         [],
+            "network_prediction": {
+                "attack_probability": cs["attack_probability"],
+                "risk":               cs["risk"],
+                "highest_risk":       highest,
+                "predicted_stage":    cs["stage"],
+                "stage_confidence":   cs["stage_confidence"],
+                "mitre_attack_id":    cs["mitre_attack_id"],
+                "mitre_attack_name":  cs["mitre_attack_name"],
+                "trajectory":         traj,
+            },
+        }
+
+    return {"analysis_id": analysis_id, **summary}
+
+
 # ── GET /analysis/{analysis_id}/metrics ──────────────────────────────────
 
 @app.get("/analysis/{analysis_id}/metrics", tags=["Upload"])
@@ -1150,3 +1411,114 @@ def _to_analysis_response(s: dict) -> dict:
         "explainability":s["explainability"],
         "metrics":       s.get("metrics"),
     }
+
+# ============================================================
+# Prediction Runs — SQLite-backed history endpoints
+# ============================================================
+# These endpoints read from and write to data/cyber_defence.db via db.py.
+# All existing /analysis/* endpoints are unchanged.
+# ============================================================
+
+# ── Pydantic response models ──────────────────────────────────────────────
+
+class RunForecastStep(BaseModel):
+    step:               int
+    attack_probability: float
+    risk_level:         str
+    predicted_stage:    str
+    stage_confidence:   float
+    mitre_id:           Optional[str]
+    mitre_technique:    Optional[str]
+
+class RunExplainFeature(BaseModel):
+    rank:        int
+    feature_name: str
+    sensitivity: float
+
+class RunSummary(BaseModel):
+    """Lightweight row returned by GET /runs."""
+    run_id:             str
+    created_at:         str
+    source_type:        str          # 'uploaded' | 'sample'
+    filename:           Optional[str]
+    status:             str
+    attack_probability: float
+    risk_level:         str
+    predicted_stage:    str
+    stage_confidence:   float
+    mitre_id:           Optional[str]
+    mitre_technique:    Optional[str]
+    file_type:          Optional[str]
+    total_records:      Optional[int]
+    total_windows:      Optional[int]
+    ts_start:           Optional[str]
+    ts_end:             Optional[str]
+
+class RunDetail(RunSummary):
+    """Full row returned by GET /runs/{run_id}."""
+    forecast:       list[RunForecastStep]
+    explainability: list[RunExplainFeature]
+    metrics:        Optional[dict]
+
+
+# ── GET /runs ─────────────────────────────────────────────────────────────
+
+@app.get("/runs", response_model=list[RunSummary], tags=["Runs"])
+def get_runs(limit: int = 50) -> list[RunSummary]:
+    """
+    Return the most recent prediction runs stored in SQLite.
+
+    Each run corresponds to one uploaded telemetry analysis.
+    Results are ordered newest-first (id DESC).
+    The limit parameter caps the number of rows (default 50, max 500).
+
+    This endpoint survives backend restarts — data comes from SQLite,
+    not the in-memory _analysis_store.
+    """
+    limit = min(max(1, limit), 500)
+    rows = list_runs(limit=limit)
+    return [RunSummary(**r) for r in rows]
+
+
+# ── GET /runs/{run_id} ────────────────────────────────────────────────────
+
+@app.get("/runs/{run_id}", response_model=RunDetail, tags=["Runs"])
+def get_run_detail(run_id: str) -> RunDetail:
+    """
+    Return the complete prediction result for one run, including
+    all 5 forecast steps and the top feature sensitivity scores.
+
+    Returns HTTP 404 when the run_id is not found in SQLite.
+    """
+    row = get_run(run_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Run '{run_id}' not found in the database.",
+        )
+    return RunDetail(
+        **{k: v for k, v in row.items()
+           if k not in ("forecast", "explainability", "metrics")},
+        forecast       = [RunForecastStep(**f) for f in row["forecast"]],
+        explainability = [RunExplainFeature(**e) for e in row["explainability"]],
+        metrics        = row.get("metrics"),
+    )
+
+
+# ── GET /runs/{run_id}/forecast ───────────────────────────────────────────
+
+@app.get("/runs/{run_id}/forecast",
+         response_model=list[RunForecastStep], tags=["Runs"])
+def get_run_forecast_steps(run_id: str) -> list[RunForecastStep]:
+    """
+    Return just the 5 autoregressive forecast steps for a stored run.
+
+    Returns HTTP 404 when the run_id is not found in SQLite.
+    """
+    steps = get_run_forecast(run_id)
+    if steps is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Run '{run_id}' not found in the database.",
+        )
+    return [RunForecastStep(**s) for s in steps]

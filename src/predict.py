@@ -34,6 +34,8 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import load_model, autoregressive_rollout, inverse_transform
 from mitre_mapping import get_mitre_mapping, format_mitre
+from alert_manager import calculate_risk_level
+from email_alert import send_alert, should_alert
 
 # ============================================================
 # Paths
@@ -155,6 +157,45 @@ def main() -> None:
     print("  MITRE ATT&CK technique. The model does not directly detect")
     print("  specific ATT&CK techniques from raw telemetry.")
     print(sep)
+
+    # ── Email alert (additive — does not affect prediction output) ──────
+    # Use the FIRST forecast step as the current prediction for alerting.
+    # The existing 5-step output above is unchanged.
+    if trajectory:
+        alert_entry    = trajectory[0]
+        alert_stage    = alert_entry["stage_name"]
+        alert_prob     = alert_entry["attack_prob"]
+        alert_conf     = alert_entry["stage_confidence"]
+        alert_mitre    = format_mitre(alert_stage)
+        alert_risk     = calculate_risk_level(alert_prob, alert_stage)
+
+        # Try to get top features from explainability (soft dependency)
+        top_features: list[str] = []
+        try:
+            from explain_prediction import explain_prediction as _explain
+            imp_df = _explain(
+                model        = model,
+                sequence     = initial_sequence,
+                feature_cols = feature_cols,
+                stage_names  = stage_names,
+                target       = "stage",
+            )
+            top_features = imp_df.head(5)["feature"].tolist()
+        except Exception:
+            pass   # explainability unavailable — email still sends
+
+        if should_alert(alert_risk):
+            print(f"\n[ALERT] Risk level {alert_risk} — attempting email notification ...")
+            send_alert(
+                risk_level         = alert_risk,
+                attack_probability = alert_prob,
+                predicted_stage    = alert_stage,
+                stage_confidence   = alert_conf,
+                mitre_technique    = alert_mitre,
+                top_features       = top_features,
+                current_stage      = current_stage,
+                sample_id          = resolved,
+            )
 
 
 if __name__ == "__main__":

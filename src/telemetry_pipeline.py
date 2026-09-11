@@ -98,6 +98,35 @@ SEQUENCE_LENGTH = 5
 # Pipeline result dataclass
 # ============================================================
 
+class EntityInfo:
+    """
+    Represents a unique network entity (endpoint) found in the uploaded telemetry.
+
+    Only populated when src_ip / dst_ip columns are present. Each entity
+    corresponds to a distinct IP address observed as a SOURCE in the traffic.
+    The risk/stage fields are populated from the NETWORK-LEVEL model inference
+    (not per-entity inference) and are clearly labelled as network-scope.
+    """
+
+    def __init__(
+        self,
+        entity_id:       str,               # e.g. "192.168.1.10"
+        record_count:    int,               # rows in the raw upload where this IP appears
+        first_seen:      str,               # ISO timestamp
+        last_seen:       str,               # ISO timestamp
+        unique_dst_ips:  list[str],         # destination IPs this entity communicated with
+        unique_dst_ports: list[int],        # destination ports
+        protocols:       list[str],         # unique protocols used
+    ) -> None:
+        self.entity_id        = entity_id
+        self.record_count     = record_count
+        self.first_seen       = first_seen
+        self.last_seen        = last_seen
+        self.unique_dst_ips   = unique_dst_ips
+        self.unique_dst_ports = unique_dst_ports
+        self.protocols        = protocols
+
+
 class PipelineResult:
     """Holds everything produced by process_uploaded_csv()."""
 
@@ -117,21 +146,27 @@ class PipelineResult:
         has_labels:      bool,
         label_col:       Optional[str],
         window_labels:   Optional[list],
+        entities:        Optional[list],    # list[EntityInfo] | None
+        has_entity_ids:  bool,              # True iff src_ip/dst_ip were present
+        prediction_scope: str,             # "network-level" | "entity-level"
     ) -> None:
-        self.states_df       = states_df         # (T, 44+) DataFrame
-        self.states_scaled   = states_scaled     # (T, 44) float32
-        self.sequences       = sequences         # (N, 5, 44) float32
-        self.feature_columns = feature_columns
-        self.scaler_mean     = scaler_mean
-        self.scaler_scale    = scaler_scale
-        self.file_type       = file_type
-        self.n_records       = n_records
-        self.time_windows    = time_windows
-        self.ts_start        = ts_start
-        self.ts_end          = ts_end
-        self.has_labels      = has_labels
-        self.label_col       = label_col
-        self.window_labels   = window_labels     # per-window ground-truth (or None)
+        self.states_df        = states_df         # (T, 44+) DataFrame
+        self.states_scaled    = states_scaled     # (T, 44) float32
+        self.sequences        = sequences         # (N, 5, 44) float32
+        self.feature_columns  = feature_columns
+        self.scaler_mean      = scaler_mean
+        self.scaler_scale     = scaler_scale
+        self.file_type        = file_type
+        self.n_records        = n_records
+        self.time_windows     = time_windows
+        self.ts_start         = ts_start
+        self.ts_end           = ts_end
+        self.has_labels       = has_labels
+        self.label_col        = label_col
+        self.window_labels    = window_labels     # per-window ground-truth (or None)
+        self.entities         = entities          # list[EntityInfo] or None
+        self.has_entity_ids   = has_entity_ids
+        self.prediction_scope = prediction_scope  # always "network-level" for current model
 
 
 # ============================================================
@@ -244,22 +279,128 @@ def process_uploaded_csv(
         for i in range(SEQUENCE_LENGTH, len(states_scaled) + 1)
     ]).astype(np.float32)
 
+    # ── Extract entity identifiers ─────────────────────────────
+    # Only when both src_ip and dst_ip columns are present in the raw data.
+    # We never manufacture identifiers — if columns are absent we set
+    # has_entity_ids=False and entities=None and label everything
+    # "NETWORK-LEVEL PREDICTION".
+    entities, has_entity_ids = _extract_entities(df)
+
+    # The current model was trained on network-level aggregated states and
+    # does not support entity-specific inference.  We always label the
+    # prediction scope accordingly.
+    prediction_scope = "network-level"
+
     return PipelineResult(
-        states_df       = states_df,
-        states_scaled   = states_scaled,
-        sequences       = sequences,
-        feature_columns = FEATURE_COLUMNS,
-        scaler_mean     = scaler_mean,
-        scaler_scale    = scaler_scale,
-        file_type       = file_type,
-        n_records       = n_records,
-        time_windows    = time_windows,
-        ts_start        = ts_start,
-        ts_end          = ts_end,
-        has_labels      = has_labels,
-        label_col       = label_col,
-        window_labels   = window_labels,
+        states_df        = states_df,
+        states_scaled    = states_scaled,
+        sequences        = sequences,
+        feature_columns  = FEATURE_COLUMNS,
+        scaler_mean      = scaler_mean,
+        scaler_scale     = scaler_scale,
+        file_type        = file_type,
+        n_records        = n_records,
+        time_windows     = time_windows,
+        ts_start         = ts_start,
+        ts_end           = ts_end,
+        has_labels       = has_labels,
+        label_col        = label_col,
+        window_labels    = window_labels,
+        entities         = entities,
+        has_entity_ids   = has_entity_ids,
+        prediction_scope = prediction_scope,
     )
+
+
+# ============================================================
+# Entity extraction
+# ============================================================
+
+MAX_ENTITIES = 200          # cap to avoid huge payloads for very large uploads
+MAX_DST_SHOW = 10           # max destination IPs/ports per entity
+
+
+def _extract_entities(
+    df: pd.DataFrame,
+) -> tuple[Optional[list], bool]:
+    """
+    Extract unique source-IP entities from raw telemetry rows.
+
+    Returns (entities, has_entity_ids).
+
+    Rules
+    -----
+    - Only runs when BOTH 'src_ip' and 'dst_ip' columns are present.
+    - Groups by src_ip; collects temporal coverage, destination diversity,
+      protocol diversity, and record count.
+    - Caps output at MAX_ENTITIES entries (sorted by record_count desc).
+    - Returns (None, False) if the columns are absent — never manufactures IDs.
+    """
+    if "src_ip" not in df.columns or "dst_ip" not in df.columns:
+        return None, False
+
+    # Drop rows where src_ip is null / empty
+    ent_df = df[df["src_ip"].notna() & (df["src_ip"].astype(str).str.strip() != "")].copy()
+    if len(ent_df) == 0:
+        return None, False
+
+    ent_df["src_ip"] = ent_df["src_ip"].astype(str).str.strip()
+    ent_df["dst_ip"] = ent_df["dst_ip"].astype(str).str.strip()
+
+    entities: list[EntityInfo] = []
+
+    grouped = ent_df.groupby("src_ip", sort=False)
+    summary = (
+        grouped
+        .agg(
+            record_count = ("timestamp", "count"),
+            first_seen   = ("timestamp", "min"),
+            last_seen    = ("timestamp", "max"),
+        )
+        .reset_index()
+        .sort_values("record_count", ascending=False)
+        .head(MAX_ENTITIES)
+    )
+
+    for _, row in summary.iterrows():
+        ip    = str(row["src_ip"])
+        grp   = ent_df[ent_df["src_ip"] == ip]
+
+        dst_ips = (
+            grp["dst_ip"].dropna().astype(str).str.strip()
+            .value_counts().head(MAX_DST_SHOW).index.tolist()
+        )
+
+        dst_ports: list[int] = []
+        if "dst_port" in grp.columns:
+            raw_ports = (
+                pd.to_numeric(grp["dst_port"], errors="coerce")
+                .dropna().astype(int)
+                .value_counts().head(MAX_DST_SHOW).index.tolist()
+            )
+            dst_ports = [int(p) for p in raw_ports]
+
+        protocols: list[str] = []
+        if "protocol" in grp.columns:
+            protocols = (
+                grp["protocol"].dropna().astype(str).str.strip()
+                .unique().tolist()[:10]
+            )
+
+        entities.append(EntityInfo(
+            entity_id        = ip,
+            record_count     = int(row["record_count"]),
+            first_seen       = str(row["first_seen"]),
+            last_seen        = str(row["last_seen"]),
+            unique_dst_ips   = dst_ips,
+            unique_dst_ports = dst_ports,
+            protocols        = protocols,
+        ))
+
+    if not entities:
+        return None, False
+
+    return entities, True
 
 
 # ============================================================

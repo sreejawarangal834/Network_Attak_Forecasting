@@ -97,16 +97,16 @@ export async function mockGetForecast(sampleId: number): Promise<ForecastRespons
 
 export async function mockGetForecastStates(sampleId: number): Promise<ForecastStatesResponse> {
   await sleep(DELAY)
-  // Produce 5 steps × 44 placeholder features
+  // Produce 5 steps × 44 placeholder features, wrapped in the real response shape
   const featureNames = Array.from({ length: 44 }, (_, i) => `feature_${i + 1}`)
-  return Array.from({ length: 5 }, (_, stepIdx) => ({
+  const steps = Array.from({ length: 5 }, (_, stepIdx) => ({
     step: stepIdx + 1,
     features: Object.fromEntries(
       featureNames.map(name => [name, parseFloat((Math.random() * 100).toFixed(4))])
     ),
   }))
-  // suppress sampleId-unused warning
   void sampleId
+  return { sample_id: sampleId, states: steps }
 }
 
 export async function mockGetExplanation(sampleId: number): Promise<ExplanationResponse> {
@@ -133,26 +133,27 @@ export async function mockGetExplanation(sampleId: number): Promise<ExplanationR
 
 export async function mockGetModelComparison(): Promise<ModelComparisonResponse> {
   await sleep(DELAY)
+  // Return a plain array matching the real backend shape (df.to_dict orient="records")
   return [
     {
+      Model: 'Logistic Regression (MOCK)',
+      Temporal_History: 'Current state only',
+      Attack_Accuracy: 0.8120,
+      Attack_Precision: 'N/A',
+      Attack_Recall: 'N/A',
+      Attack_F1: 0.8130,
+      Stage_Accuracy: 0.6710,
+      Stage_Macro_F1: 0.6480,
+    },
+    {
       Model: 'Temporal Transformer (MOCK)',
-      Temporal_History: 5,
+      Temporal_History: '5 temporal states',
       Attack_Accuracy: 0.9412,
       Attack_Precision: 0.9380,
       Attack_Recall: 0.9460,
       Attack_F1: 0.9420,
       Stage_Accuracy: 0.8890,
       Stage_Macro_F1: 0.8760,
-    },
-    {
-      Model: 'Logistic Regression (MOCK)',
-      Temporal_History: 1,
-      Attack_Accuracy: 0.8120,
-      Attack_Precision: 0.8050,
-      Attack_Recall: 0.8220,
-      Attack_F1: 0.8130,
-      Stage_Accuracy: 0.6710,
-      Stage_Macro_F1: 0.6480,
     },
   ]
 }
